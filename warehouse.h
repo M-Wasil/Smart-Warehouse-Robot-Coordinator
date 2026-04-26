@@ -60,6 +60,9 @@ typedef struct{
     int robotTasksCompleted[MAX_ROBOTS];
     int robotZoneWaits[MAX_ROBOTS];
     int robotCollisionWaits[MAX_ROBOTS];
+    int robotHasItem[MAX_ROBOTS];
+    int robotTargetX[MAX_ROBOTS];   /* current nav target column, -1=none */
+    int robotTargetY[MAX_ROBOTS];   /* current nav target row,    -1=none */
     int totalCollisionWaits;
     int zoneInUse;
     int zoneUsageEvents;

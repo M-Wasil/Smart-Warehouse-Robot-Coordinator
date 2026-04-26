@@ -1,24 +1,15 @@
 /* ================================================================
-   gui.c  --  Raylib GUI for the Smart Warehouse Robot Coordinator
+   gui.c  --  Revamped Raylib GUI for Smart Warehouse Simulator
 
-   Design principles:
-     1. GUI thread NEVER writes to Warehouse fields.
-     2. Locks are held only during the "sample" phase, not during
-        the "draw" phase (lock â†’ copy â†’ unlock â†’ draw).
-     3. All drawing uses basic Raylib primitives (rectangles,
-        circles, text) -- no textures, no external assets.
-     4. The render loop is non-blocking: WindowShouldClose() and
-        BeginDrawing()/EndDrawing() do not sleep.
+   Visual layout:
+     Row 0 (top)    : SHELVES  -- warm brown background, item slots
+     Row 1-3 (mid)  : FLOOR    -- dark blue navigation area
+     Row 4 (bottom) : DOCKS    -- teal pads where robots wait
+     Columns 2-3    : CRITICAL ZONE -- marked orange border
 
-   OS concept mapping (important for viva):
-     - The GUI loop is effectively a high-priority "monitor thread"
-       that observes shared state using the SAME mutexes the robot
-       threads use for writes.  This is safe because Raylib renders
-       from a private GuiFrame copy, so robots can keep running
-       while the GPU draws the previous frame.
-     - cellOccupancy and robotState are protected by stateMutex;
-       stats by statsMutex; task queue by taskMutex.  We acquire
-       each only briefly to memcpy the relevant fields.
+   Thread safety:
+     gui_sample_frame() locks briefly to copy state.
+     gui_draw_frame()   draws from the private copy -- no locks held.
    ================================================================ */
 
 #include "gui.h"
@@ -28,468 +19,433 @@
 #include <time.h>
 
 /* ================================================================
-   Colour palette  (dark industrial theme suits an OS demo)
+   Colour palette
    ================================================================ */
-static const Color C_BG          = { 18,  20,  30, 255 }; /* near-black bg    */
-static const Color C_GRID_EMPTY  = { 38,  42,  60, 255 }; /* dark cell        */
-static const Color C_GRID_CZ     = { 60,  35,  20, 255 }; /* critical zone    */
-static const Color C_GRID_OCC    = { 50,  60,  90, 255 }; /* occupied cell    */
-static const Color C_ITEM        = {220, 180,  60, 255 }; /* yellow item dot  */
-static const Color C_PANEL_BG    = { 25,  28,  45, 255 }; /* right panel bg   */
-static const Color C_BORDER      = { 70,  80, 110, 255 }; /* grid border      */
-static const Color C_TEXT        = {210, 215, 230, 255 }; /* normal text      */
-static const Color C_TEXT_DIM    = {120, 130, 155, 255 }; /* dimmed text      */
-static const Color C_ACCENT      = { 80, 160, 255, 255 }; /* blue accent      */
-static const Color C_TITLE       = {255, 200,  80, 255 }; /* title gold       */
+static const Color C_BG          = {  15,  17,  26, 255 }; /* near-black bg     */
+static const Color C_SHELF       = {  80,  52,  20, 255 }; /* warm brown shelf  */
+static const Color C_FLOOR       = {  30,  36,  55, 255 }; /* dark blue floor   */
+static const Color C_FLOOR_CZ    = {  55,  30,  15, 255 }; /* CZ floor          */
+static const Color C_DOCK        = {  18,  55,  55, 255 }; /* teal dock pad     */
+static const Color C_OCC         = {  45,  58,  95, 255 }; /* occupied cell     */
+static const Color C_ITEM_FLOOR  = { 240, 190,  50, 255 }; /* yellow floor item */
+static const Color C_ITEM_SHELF  = { 100, 220, 120, 255 }; /* green shelf item  */
+static const Color C_PANEL_BG    = {  22,  25,  40, 255 };
+static const Color C_BORDER      = {  65,  75, 110, 255 };
+static const Color C_BORDER_CZ   = { 200,  90,  30, 255 };
+static const Color C_TEXT        = { 210, 215, 230, 255 };
+static const Color C_TEXT_DIM    = { 110, 120, 148, 255 };
+static const Color C_ACCENT      = {  80, 160, 255, 255 };
+static const Color C_TITLE       = { 255, 200,  80, 255 };
+static const Color C_HINT        = {  80, 220, 140, 200 };
+static const Color C_PATH_DOT    = { 255, 255, 255,  55 }; /* faint path trail  */
+static const Color C_HOVER_FILL  = {  80, 200, 255,  45 };
+static const Color C_HOVER_RING  = {  80, 200, 255, 200 };
 
-/* Robot state colours (OS analogy: thread state colours) */
-static const Color C_MOVING      = { 60, 220,  90, 255 }; /* green  = running */
-static const Color C_WAIT_ZONE   = {230,  70,  70, 255 }; /* red    = blocked */
-static const Color C_WAIT_CELL   = {230, 120,  40, 255 }; /* orange = blocked */
-static const Color C_IDLE        = {160, 165, 190, 255 }; /* grey   = idle    */
+/* Robot state colours */
+static const Color C_MOVING      = {  50, 220,  90, 255 };
+static const Color C_WAIT_ZONE   = { 230,  65,  65, 255 };
+static const Color C_WAIT_CELL   = { 230, 120,  35, 255 };
+static const Color C_IDLE        = { 150, 158, 185, 255 };
 
 /* ================================================================
-   gui_init
-   Open Raylib window.  Must be called from the main thread before
-   any other Raylib calls.
+   gui_init / gui_close
    ================================================================ */
 void gui_init(void) {
-    SetTraceLogLevel(LOG_WARNING);   /* suppress verbose Raylib info logs */
+    SetTraceLogLevel(LOG_WARNING);
     InitWindow(WIN_W, WIN_H, "Smart Warehouse Robot Coordinator");
     SetTargetFPS(FPS);
 }
-
-/* ================================================================
-   gui_close
-   ================================================================ */
-void gui_close(void) {
-    CloseWindow();
-}
+void gui_close(void) { CloseWindow(); }
 
 /* ================================================================
    gui_cell_center
-   Convert a grid (col, row) to pixel coordinates of the cell centre.
-
-   Layout:
-     col 0 left edge  = GRID_OFF_X
-     row 0 top  edge  = GRID_OFF_Y
-     cell width/height = CELL_PX + GAP_PX
    ================================================================ */
 Vector2 gui_cell_center(int gridX, int gridY) {
-    Vector2 v;
-    v.x = (float)(GRID_OFF_X + gridX * (CELL_PX + GAP_PX) + CELL_PX / 2);
-    v.y = (float)(GRID_OFF_Y + gridY * (CELL_PX + GAP_PX) + CELL_PX / 2);
-    return v;
+    return (Vector2){
+        (float)(GRID_OFF_X + gridX * (CELL_PX + GAP_PX) + CELL_PX / 2),
+        (float)(GRID_OFF_Y + gridY * (CELL_PX + GAP_PX) + CELL_PX / 2)
+    };
 }
 
 /* ================================================================
-   robot_color
-   Map a RobotState enum to a display colour.
-
-   OS parallel:
-     ROBOT_IDLE            â†’ thread in TASK_INTERRUPTIBLE (sleeping)
-     ROBOT_MOVING          â†’ thread RUNNING on CPU
-     ROBOT_WAITING_FOR_ZONEâ†’ thread blocked on semaphore (TASK_UNINTERRUPTIBLE)
-     ROBOT_WAITING_FOR_CELLâ†’ thread blocked on mutex    (TASK_UNINTERRUPTIBLE)
+   robot_color / robot_state_name
    ================================================================ */
 static Color robot_color(RobotState s) {
     switch (s) {
-        case ROBOT_MOVING:          return C_MOVING;
-        case ROBOT_WAITING_FOR_ZONE:return C_WAIT_ZONE;
-        case ROBOT_WAITING_FOR_CELL:return C_WAIT_CELL;
-        case ROBOT_IDLE:
-        default:                    return C_IDLE;
+        case ROBOT_MOVING:           return C_MOVING;
+        case ROBOT_WAITING_FOR_ZONE: return C_WAIT_ZONE;
+        case ROBOT_WAITING_FOR_CELL: return C_WAIT_CELL;
+        default:                     return C_IDLE;
     }
 }
-
-static const char* robot_state_name(RobotState s) {
+static const char *robot_state_name(RobotState s) {
     switch (s) {
         case ROBOT_MOVING:           return "MOVING";
         case ROBOT_WAITING_FOR_ZONE: return "WAIT ZONE";
         case ROBOT_WAITING_FOR_CELL: return "WAIT CELL";
-        case ROBOT_IDLE:
         default:                     return "IDLE";
     }
 }
 
 /* ================================================================
    gui_sample_frame
-   Atomically snapshot all shared state the GUI needs.
-
-   Locking strategy:
-     We acquire each mutex independently (not all at once) to avoid
-     holding multiple locks simultaneously, which would increase
-     contention with the robot threads.
-
-     Order:
-       1. stateMutex  â†’ copy cellOccupancy + robotState
-       2. statsMutex  â†’ copy performance counters
-       3. taskMutex   â†’ copy queue depth + item table
-
-   This is safe because the GUI only READS -- it does not modify
-   any Warehouse field -- so it never contributes to deadlock.
    ================================================================ */
 void gui_sample_frame(Warehouse *wh, int numRobots, GuiFrame *f,
                       time_t simStart) {
     int i, r, c;
 
-    /* ---- 1. Sample grid occupancy + robot states (stateMutex) -- */
+    /* 1. Grid + robot states */
     pthread_mutex_lock(&wh->stateMutex);
-
     for (r = 0; r < ROWS; r++)
         for (c = 0; c < COLS; c++)
             f->cellOcc[r][c] = wh->cellOccupancy[r][c];
-
     f->numRobots = (numRobots < MAX_ROBOTS) ? numRobots : MAX_ROBOTS;
     for (i = 0; i < f->numRobots; i++) {
-        f->robots[i].id    = i + 1;
-        f->robots[i].state = wh->robotState[i];
+        f->robots[i].id      = i + 1;
+        f->robots[i].state   = wh->robotState[i];
+        f->robots[i].hasItem = wh->robotHasItem[i];
+        f->robots[i].targetX = wh->robotTargetX[i];
+        f->robots[i].targetY = wh->robotTargetY[i];
     }
-
     pthread_mutex_unlock(&wh->stateMutex);
 
-    /* ---- 2. Sample performance stats (statsMutex) -------------- */
+    /* 2. Stats */
     pthread_mutex_lock(&wh->statsMutex);
-
     f->totalDone      = wh->totalTasksCompleted;
     f->zoneInUse      = wh->zoneInUse;
     f->zoneBlockCount = wh->zoneBlockCount;
     f->collisionWaits = wh->totalCollisionWaits;
     f->totalWaitTime  = wh->totalWaitTime;
-
     for (i = 0; i < f->numRobots; i++) {
-        f->robots[i].tasksCompleted  = wh->robotTasksCompleted[i];
-        f->robots[i].zoneWaits       = wh->robotZoneWaits[i];
-        f->robots[i].collisionWaits  = wh->robotCollisionWaits[i];
+        f->robots[i].tasksCompleted = wh->robotTasksCompleted[i];
+        f->robots[i].zoneWaits      = wh->robotZoneWaits[i];
+        f->robots[i].collisionWaits = wh->robotCollisionWaits[i];
     }
-
     pthread_mutex_unlock(&wh->statsMutex);
 
-    /* ---- 3. Sample item table + queue depth (taskMutex) -------- */
+    /* 3. Items + queue */
     pthread_mutex_lock(&wh->taskMutex);
-
     f->itemCount = (wh->itemCount < MAX_ITEMS) ? wh->itemCount : MAX_ITEMS;
     for (i = 0; i < f->itemCount; i++) {
-        f->itemAvail[i] = wh->items[i].available;
-        f->itemX[i]     = wh->items[i].x;
-        f->itemY[i]     = wh->items[i].y;
+        f->itemAvail[i]     = wh->items[i].available;
+        f->itemCompleted[i] = wh->items[i].completed;
+        f->itemX[i]         = wh->items[i].x;
+        f->itemY[i]         = wh->items[i].y;
     }
     f->queueDepth = wh->taskQueue.size;
-
     pthread_mutex_unlock(&wh->taskMutex);
 
-    /* ---- 4. Elapsed time (no lock needed -- simStart is const) - */
     f->elapsedSec = difftime(time(NULL), simStart);
 }
 
 /* ================================================================
-   draw_grid
-   Draw the 5x5 warehouse grid.
-
-   Visual encoding:
-     - Dark blue cell   = empty normal cell
-     - Dark orange cell = empty Critical Zone cell (columns 2-3)
-     - Brighter cell    = cell currently occupied by a robot
-     - Yellow dot       = unclaimed item sitting on the floor
+   draw_grid  --  main grid with shelves, floor, docks, CZ, items
    ================================================================ */
-static void draw_grid(const GuiFrame *f) {
-    int r, c, i;
+static void draw_grid(const GuiFrame *f, int hoverGX, int hoverGY) {
+    /* Section label */
+    DrawText("WAREHOUSE", GRID_OFF_X, 52, 14, C_ACCENT);
 
-    /* Column range of the Critical Zone (mirrors warehouse.h logic) */
-    /* CZ is defined in warehouse.h but since we can't call the
-       warehouse function from pure GUI code we replicate the range.
-       Critical Zone = columns where X >= 2 and X <= 3 on a 5x5 grid.
-       (Adjust these constants to match your warehouse.h CZ_X_MIN/MAX) */
-    const int CZ_MIN = 2;
-    const int CZ_MAX = 3;
-
-    /* --- Draw section label --- */
-    DrawText("WAREHOUSE GRID", GRID_OFF_X, 50, 16, C_ACCENT);
-
-    /* --- Draw column numbers above grid --- */
-    for (c = 0; c < COLS; c++) {
-        char label[4];
-        snprintf(label, sizeof(label), "%d", c);
-        int lx = GRID_OFF_X + c * (CELL_PX + GAP_PX) + CELL_PX/2 - 4;
-        DrawText(label, lx, GRID_OFF_Y - 20, 14, C_TEXT_DIM);
-    }
-    /* --- Draw row numbers left of grid --- */
-    for (r = 0; r < ROWS; r++) {
-        char label[4];
-        snprintf(label, sizeof(label), "%d", r);
-        int ly = GRID_OFF_Y + r * (CELL_PX + GAP_PX) + CELL_PX/2 - 7;
-        DrawText(label, GRID_OFF_X - 18, ly, 14, C_TEXT_DIM);
+    /* Row labels */
+    const char *rowLabels[ROWS] = { "SHELF", "FLOOR", "FLOOR", "FLOOR", "DOCK" };
+    for (int r = 0; r < ROWS; r++) {
+        int ly = GRID_OFF_Y + r * (CELL_PX + GAP_PX) + CELL_PX / 2 - 6;
+        DrawText(rowLabels[r], GRID_OFF_X - 56, ly, 10,
+                 r == 0 ? C_ITEM_FLOOR : r == 4 ? C_HINT : C_TEXT_DIM);
     }
 
-    /* --- Draw cells --- */
-    for (r = 0; r < ROWS; r++) {
-        for (c = 0; c < COLS; c++) {
+    /* Column numbers */
+    for (int c = 0; c < COLS; c++) {
+        char lbl[4]; snprintf(lbl, 4, "%d", c);
+        int lx = GRID_OFF_X + c * (CELL_PX + GAP_PX) + CELL_PX / 2 - 4;
+        DrawText(lbl, lx, GRID_OFF_Y - 18, 13, C_TEXT_DIM);
+    }
+
+    /* Draw cells */
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
             int px = GRID_OFF_X + c * (CELL_PX + GAP_PX);
             int py = GRID_OFF_Y + r * (CELL_PX + GAP_PX);
+            int occ  = f->cellOcc[r][c];
+            int inCZ = (c == 2 || c == 3);
 
-            /* Choose cell background colour */
+            /* Choose background */
             Color bg;
-            int occ = f->cellOcc[r][c];
-            int inCZ = (c >= CZ_MIN && c <= CZ_MAX);
+            if (r == 0)       bg = occ != -1 ? C_OCC : C_SHELF;
+            else if (r == 4)  bg = occ != -1 ? C_OCC : C_DOCK;
+            else if (inCZ)    bg = occ != -1 ? C_OCC : C_FLOOR_CZ;
+            else              bg = occ != -1 ? C_OCC : C_FLOOR;
 
-            if (occ != -1) {
-                bg = C_GRID_OCC;          /* robot is here */
-            } else if (inCZ) {
-                bg = C_GRID_CZ;           /* critical zone */
-            } else {
-                bg = C_GRID_EMPTY;        /* normal empty  */
-            }
-
-            /* Draw cell rectangle */
             DrawRectangle(px, py, CELL_PX, CELL_PX, bg);
-            /* Draw cell border */
-            DrawRectangleLines(px, py, CELL_PX, CELL_PX, C_BORDER);
 
-            /* Draw "CZ" label inside Critical Zone cells */
-            if (inCZ && occ == -1) {
-                DrawText("CZ", px + CELL_PX/2 - 10, py + CELL_PX/2 - 7,
-                         14, (Color){200, 100, 50, 120});
+            /* Shelf row: draw a slim plank line */
+            if (r == 0)
+                DrawLine(px + 4, py + CELL_PX - 8, px + CELL_PX - 4,
+                         py + CELL_PX - 8, (Color){180, 130, 60, 80});
+
+            /* Dock row: draw pad circle */
+            if (r == 4 && occ == -1)
+                DrawCircleLines(px + CELL_PX/2, py + CELL_PX/2,
+                                14, (Color){40, 160, 160, 80});
+
+            /* CZ border (orange) */
+            if (inCZ && r > 0 && r < 4)
+                DrawRectangleLines(px, py, CELL_PX, CELL_PX, C_BORDER_CZ);
+            else if (c == hoverGX && r == hoverGY) {
+                DrawRectangle(px, py, CELL_PX, CELL_PX, C_HOVER_FILL);
+                DrawRectangleLines(px, py, CELL_PX, CELL_PX, C_HOVER_RING);
+                DrawRectangleLines(px+1, py+1, CELL_PX-2, CELL_PX-2, C_HOVER_RING);
+            } else {
+                DrawRectangleLines(px, py, CELL_PX, CELL_PX, C_BORDER);
             }
 
-            /* Draw coordinate label (small, top-left of cell) */
-            char coord[8];
-            snprintf(coord, sizeof(coord), "%d,%d", c, r);
-            DrawText(coord, px + 4, py + 4, 10, C_TEXT_DIM);
+            /* Row/Col coord label */
+            char coord[8]; snprintf(coord, 8, "%d,%d", c, r);
+            DrawText(coord, px + 4, py + 4, 9, C_TEXT_DIM);
+
+            /* CZ label on floor cells */
+            if (inCZ && r >= 1 && r <= 3 && occ == -1)
+                DrawText("CZ", px + CELL_PX/2 - 8, py + CELL_PX/2 - 6,
+                         12, (Color){200, 100, 50, 100});
+
+            /* SHELF label on empty shelf cells */
+            if (r == 0 && occ == -1) {
+                DrawText("SHELF", px + 4, py + CELL_PX/2 - 6, 10,
+                         (Color){200, 160, 80, 90});
+            }
+
+            /* DOCK label */
+            if (r == 4 && occ == -1)
+                DrawText("DOCK", px + CELL_PX/2 - 14, py + CELL_PX - 18,
+                         10, (Color){60, 180, 180, 80});
         }
     }
 
-    /* --- Draw items (yellow dots on floor) --- */
-    for (i = 0; i < f->itemCount; i++) {
-        if (!f->itemAvail[i]) continue;  /* already picked or done */
-        int ix = f->itemX[i];
-        int iy = f->itemY[i];
-        if (ix < 0 || ix >= COLS || iy < 0 || iy >= ROWS) continue;
-
-        Vector2 centre = gui_cell_center(ix, iy);
-        DrawCircleV(centre, 8.0f, C_ITEM);
-        DrawCircleLines((int)centre.x, (int)centre.y, 8, (Color){255,240,100,200});
+    /* Draw delivered items on shelves (green) */
+    for (int i = 0; i < f->itemCount; i++) {
+        if (!f->itemCompleted[i]) continue;
+        int ix = f->itemX[i], iy = f->itemY[i];
+        if (iy != 0 || ix < 0 || ix >= COLS) continue;
+        Vector2 ctr = gui_cell_center(ix, iy);
+        DrawRectangle((int)ctr.x - 10, (int)ctr.y - 10, 20, 20, C_ITEM_SHELF);
+        DrawRectangleLines((int)ctr.x - 10, (int)ctr.y - 10, 20, 20,
+                           (Color){160, 255, 180, 180});
+        DrawText("pkg", (int)ctr.x - 9, (int)ctr.y - 6, 10, C_BG);
     }
 
-    /* --- Critical Zone legend box --- */
-    int legX = GRID_OFF_X;
-    int legY = GRID_OFF_Y + ROWS * (CELL_PX + GAP_PX) + 12;
-    DrawRectangle(legX, legY, 16, 12, C_GRID_CZ);
-    DrawText("= Critical Zone (sem, max 2 robots)", legX + 22, legY, 13, C_TEXT_DIM);
+    /* Draw floor items (yellow circles) */
+    for (int i = 0; i < f->itemCount; i++) {
+        if (!f->itemAvail[i]) continue;
+        int ix = f->itemX[i], iy = f->itemY[i];
+        if (ix < 0 || ix >= COLS || iy < 0 || iy >= ROWS) continue;
+        Vector2 ctr = gui_cell_center(ix, iy);
+        DrawCircleV(ctr, 9.0f, C_ITEM_FLOOR);
+        DrawCircleLines((int)ctr.x, (int)ctr.y, 9,
+                        (Color){255, 240, 120, 200});
+        DrawText("!", (int)ctr.x - 2, (int)ctr.y - 6, 12, C_BG);
+    }
+
+    /* Interaction hint */
+    int hintY = GRID_OFF_Y + ROWS * (CELL_PX + GAP_PX) + 14;
+    float pulse = (float)(0.55 + 0.45 * sin(GetTime() * 2.2));
+    Color hintCol = {C_HINT.r, C_HINT.g, C_HINT.b, (unsigned char)(pulse * 210)};
+    DrawText("[ Click FLOOR rows 1-3 to spawn a delivery task ]",
+             GRID_OFF_X, hintY, 13, hintCol);
+
+    /* Legend row */
+    int legY = hintY + 18;
+    DrawRectangle(GRID_OFF_X,      legY, 12, 10, C_SHELF);
+    DrawText("= Shelf",  GRID_OFF_X + 15,  legY, 11, C_TEXT_DIM);
+    DrawRectangle(GRID_OFF_X + 75, legY, 12, 10, C_DOCK);
+    DrawText("= Dock",   GRID_OFF_X + 90,  legY, 11, C_TEXT_DIM);
+    DrawRectangle(GRID_OFF_X + 148, legY, 12, 10, C_FLOOR_CZ);
+    DrawText("= CZ (sem)", GRID_OFF_X + 163, legY, 11, C_TEXT_DIM);
+    DrawCircle(GRID_OFF_X + 252, legY + 5, 5, C_ITEM_FLOOR);
+    DrawText("= Item", GRID_OFF_X + 260,  legY, 11, C_TEXT_DIM);
+    DrawRectangle(GRID_OFF_X + 308, legY, 10, 10, C_ITEM_SHELF);
+    DrawText("= Shelved", GRID_OFF_X + 322, legY, 11, C_TEXT_DIM);
 }
 
 /* ================================================================
-   draw_robots
-   Draw each robot as a coloured circle with its ID.
-
-   Placement logic:
-     - If a robot's last known occupied cell is visible we place it
-       exactly at that cell centre.
-     - If not (robot between cells), we fall back to a fixed
-       "home" position in a row below the grid so it's always visible.
-
-   The colour encodes the OS thread state (see robot_color()).
+   draw_robots  --  circles + path lines to target
    ================================================================ */
 static void draw_robots(const GuiFrame *f) {
-    int i, r, c;
-
-    DrawText("ROBOTS", GRID_OFF_X,
-             GRID_OFF_Y + ROWS*(CELL_PX+GAP_PX) + 40, 16, C_ACCENT);
-
-    for (i = 0; i < f->numRobots; i++) {
+    /* Draw path lines FIRST (behind robots) */
+    for (int i = 0; i < f->numRobots; i++) {
         const GuiRobotSnapshot *rb = &f->robots[i];
-        int rid = rb->id;
+        if (rb->targetX < 0 || rb->targetY < 0) continue;
 
-        /* Find which cell this robot occupies (scan cellOcc) */
+        /* Find robot's screen position from cell occupancy */
         int foundR = -1, foundC = -1;
-        for (r = 0; r < ROWS && foundR == -1; r++) {
-            for (c = 0; c < COLS && foundR == -1; c++) {
-                if (f->cellOcc[r][c] == rid) {
-                    foundR = r;
-                    foundC = c;
-                }
-            }
+        for (int r = 0; r < ROWS && foundR == -1; r++)
+            for (int c = 0; c < COLS && foundR == -1; c++)
+                if (f->cellOcc[r][c] == rb->id) { foundR = r; foundC = c; }
+
+        if (foundR == -1) continue;
+
+        Vector2 from = gui_cell_center(foundC, foundR);
+        Vector2 to   = gui_cell_center(rb->targetX, rb->targetY);
+
+        /* Draw dotted line from robot to target */
+        float dx = to.x - from.x, dy = to.y - from.y;
+        float dist = sqrtf(dx*dx + dy*dy);
+        int steps = (int)(dist / 18.0f);
+        for (int s = 1; s < steps; s++) {
+            float t = (float)s / steps;
+            float sx = from.x + dx * t;
+            float sy = from.y + dy * t;
+            DrawCircle((int)sx, (int)sy, 2.5f, C_PATH_DOT);
         }
+        /* Target marker (X at destination) */
+        DrawCircleLines((int)to.x, (int)to.y, 10,
+                        (Color){255, 255, 255, 60});
+    }
+
+    /* Draw robots */
+    for (int i = 0; i < f->numRobots; i++) {
+        const GuiRobotSnapshot *rb = &f->robots[i];
+
+        int foundR = -1, foundC = -1;
+        for (int r = 0; r < ROWS && foundR == -1; r++)
+            for (int c = 0; c < COLS && foundR == -1; c++)
+                if (f->cellOcc[r][c] == rb->id) { foundR = r; foundC = c; }
 
         float px, py;
         if (foundR != -1) {
             Vector2 cv = gui_cell_center(foundC, foundR);
-            px = cv.x;
-            py = cv.y;
+            px = cv.x; py = cv.y;
         } else {
-            /* Not on grid -- show in robot home row below grid */
-            int homeY = GRID_OFF_Y + ROWS*(CELL_PX+GAP_PX) + 55;
-            px = (float)(GRID_OFF_X + (i % COLS) * (CELL_PX + GAP_PX) + CELL_PX/2);
-            py = (float)(homeY + 20);
+            px = (float)(GRID_OFF_X + i * 90 + CELL_PX/2);
+            py = (float)(GRID_OFF_Y + (ROWS + 1) * (CELL_PX + GAP_PX));
         }
 
         Color col = robot_color(rb->state);
 
-        /* Outer glow ring (shows blockage more visibly) */
+        /* Glow ring when blocked */
         if (rb->state == ROBOT_WAITING_FOR_ZONE ||
             rb->state == ROBOT_WAITING_FOR_CELL) {
-            DrawCircleLines((int)px, (int)py, ROBOT_R + 4,
-                            (Color){col.r, col.g, col.b, 100});
+            DrawCircleLines((int)px, (int)py, ROBOT_R + 5,
+                            (Color){col.r, col.g, col.b, 90});
         }
 
-        /* Main robot circle */
         DrawCircleV((Vector2){px, py}, (float)ROBOT_R, col);
         DrawCircleLines((int)px, (int)py, ROBOT_R, WHITE);
 
-        /* Robot ID label inside circle */
-        char idstr[4];
-        snprintf(idstr, sizeof(idstr), "R%d", rid);
+        char idstr[4]; snprintf(idstr, 4, "R%d", rb->id);
         int tw = MeasureText(idstr, 12);
         DrawText(idstr, (int)px - tw/2, (int)py - 6, 12, BLACK);
+
+        /* Item carried dot */
+        if (rb->hasItem) {
+            DrawCircle((int)px + 7, (int)py + 7, 5, C_ITEM_FLOOR);
+            DrawCircleLines((int)px + 7, (int)py + 7, 5, C_BG);
+        }
     }
 }
 
 /* ================================================================
-   draw_stats_panel
-   Right-hand panel showing live OS-level metrics.
-
-   Each metric maps directly to a synchronization concept:
-     zoneInUse      â†’ current semaphore value consumers
-     zoneBlockCount â†’ sem_wait() contention count
-     collisionWaits â†’ mutex contention count (cellOcc)
-     queueDepth     â†’ scheduler run-queue depth
+   draw_stats_panel  --  right-hand live monitor
    ================================================================ */
 static void draw_stats_panel(const GuiFrame *f, int simRunning) {
-    int px = PANEL_X;
-    int py = 40;
-    int lh = 22;   /* line height */
+    int px = PANEL_X, py = 40, lh = 22;
 
-    /* Panel background */
     DrawRectangle(px - 10, 30, PANEL_W + 10, WIN_H - 40, C_PANEL_BG);
     DrawRectangleLines(px - 10, 30, PANEL_W + 10, WIN_H - 40, C_BORDER);
 
-    /* ---- Title ---- */
-    DrawText("LIVE MONITOR", px, py, 18, C_TITLE);
-    py += 28;
+    DrawText("LIVE MONITOR", px, py, 18, C_TITLE); py += 28;
 
-    /* ---- Simulation status ---- */
-    const char *status = simRunning ? "[ RUNNING ]" : "[ STOPPED ]";
     Color sc = simRunning ? C_MOVING : C_WAIT_ZONE;
-    DrawText(status, px, py, 15, sc);
+    DrawText(simRunning ? "[ RUNNING ]" : "[ STOPPED ]", px, py, 15, sc);
     py += lh + 4;
 
-    /* ---- Elapsed time ---- */
     char buf[128];
-    snprintf(buf, sizeof(buf), "Elapsed: %.1f s", f->elapsedSec);
+    snprintf(buf, sizeof(buf), "Elapsed : %.0f s", f->elapsedSec);
     DrawText(buf, px, py, 14, C_TEXT); py += lh;
 
-    /* ---- Divider ---- */
     DrawLine(px, py, px + PANEL_W - 10, py, C_BORDER); py += 10;
-
-    /* ---- Task stats ---- */
     DrawText("TASK SCHEDULER", px, py, 14, C_ACCENT); py += lh;
 
     snprintf(buf, sizeof(buf), "Completed : %d", f->totalDone);
     DrawText(buf, px, py, 13, C_TEXT); py += lh;
 
-    snprintf(buf, sizeof(buf), "Queue depth: %d", f->queueDepth);
+    snprintf(buf, sizeof(buf), "In queue  : %d", f->queueDepth);
     DrawText(buf, px, py, 13, C_TEXT); py += lh;
 
-    double throughput = (f->elapsedSec > 0.0)
-                        ? (double)f->totalDone / f->elapsedSec : 0.0;
-    snprintf(buf, sizeof(buf), "Throughput : %.2f t/s", throughput);
+    snprintf(buf, sizeof(buf), "Items     : %d", f->itemCount);
     DrawText(buf, px, py, 13, C_TEXT); py += lh;
 
-    double avgWait = (f->totalDone > 0)
-                     ? f->totalWaitTime / f->totalDone : 0.0;
-    snprintf(buf, sizeof(buf), "Avg wait   : %.2f s", avgWait);
+    double tp = f->elapsedSec > 0 ? (double)f->totalDone / f->elapsedSec : 0;
+    snprintf(buf, sizeof(buf), "Throughput: %.2f t/s", tp);
     DrawText(buf, px, py, 13, C_TEXT); py += lh;
 
-    /* ---- Divider ---- */
     DrawLine(px, py, px + PANEL_W - 10, py, C_BORDER); py += 10;
-
-    /* ---- Synchronization metrics ---- */
     DrawText("SYNC METRICS", px, py, 14, C_ACCENT); py += lh;
 
-    /* Critical Zone semaphore */
-    Color czCol = (f->zoneInUse >= 2) ? C_WAIT_ZONE : C_MOVING;
-    snprintf(buf, sizeof(buf), "CZ in use  : %d / 2", f->zoneInUse);
-    DrawText(buf, px, py, 13, czCol); py += lh;
+    Color czC = (f->zoneInUse >= 2) ? C_WAIT_ZONE : C_MOVING;
+    snprintf(buf, sizeof(buf), "CZ in use : %d / 2", f->zoneInUse);
+    DrawText(buf, px, py, 13, czC); py += lh;
 
-    snprintf(buf, sizeof(buf), "Sem blocks : %d", f->zoneBlockCount);
-    Color sbCol = (f->zoneBlockCount > 0) ? C_WAIT_ZONE : C_TEXT;
-    DrawText(buf, px, py, 13, sbCol); py += lh;
+    Color sbC = f->zoneBlockCount > 0 ? C_WAIT_ZONE : C_TEXT;
+    snprintf(buf, sizeof(buf), "Sem blocks: %d", f->zoneBlockCount);
+    DrawText(buf, px, py, 13, sbC); py += lh;
 
-    snprintf(buf, sizeof(buf), "Cell waits : %d", f->collisionWaits);
-    Color cwCol = (f->collisionWaits > 0) ? C_WAIT_CELL : C_TEXT;
-    DrawText(buf, px, py, 13, cwCol); py += lh;
+    Color cwC = f->collisionWaits > 0 ? C_WAIT_CELL : C_TEXT;
+    snprintf(buf, sizeof(buf), "Cell waits: %d", f->collisionWaits);
+    DrawText(buf, px, py, 13, cwC); py += lh;
 
-    /* ---- Divider ---- */
     DrawLine(px, py, px + PANEL_W - 10, py, C_BORDER); py += 10;
-
-    /* ---- Per-robot table ---- */
     DrawText("PER-ROBOT STATUS", px, py, 14, C_ACCENT); py += lh;
-
-    /* Header */
-    DrawText("ID  STATE       DONE ZW CW", px, py, 11, C_TEXT_DIM); py += 16;
+    DrawText("    STATE       DONE ZW CW", px, py, 11, C_TEXT_DIM); py += 16;
 
     for (int i = 0; i < f->numRobots; i++) {
         const GuiRobotSnapshot *rb = &f->robots[i];
         Color rc = robot_color(rb->state);
-
-        /* Coloured indicator square */
         DrawRectangle(px, py + 1, 10, 10, rc);
-
-        snprintf(buf, sizeof(buf), "  R%d %-9s  %3d %2d %2d",
-                 rb->id,
-                 robot_state_name(rb->state),
-                 rb->tasksCompleted,
-                 rb->zoneWaits,
-                 rb->collisionWaits);
+        if (rb->hasItem)
+            DrawCircle(px + 17, py + 5, 4, C_ITEM_FLOOR);
+        snprintf(buf, sizeof(buf), "  R%d %-9s %3d %2d %2d",
+                 rb->id, robot_state_name(rb->state),
+                 rb->tasksCompleted, rb->zoneWaits, rb->collisionWaits);
         DrawText(buf, px, py, 12, C_TEXT);
         py += 18;
     }
 
-    /* ---- Divider ---- */
     DrawLine(px, py, px + PANEL_W - 10, py, C_BORDER); py += 10;
-
-    /* ---- State legend ---- */
     DrawText("THREAD STATE LEGEND", px, py, 12, C_ACCENT); py += 16;
-
-    struct { Color c; const char *lbl; } legend[] = {
-        { C_MOVING,    "MOVING     (running on CPU)"    },
-        { C_WAIT_ZONE, "WAIT ZONE  (blocked on sem)"    },
-        { C_WAIT_CELL, "WAIT CELL  (blocked on mutex)"  },
-        { C_IDLE,      "IDLE       (sleeping/yielded)"  },
+    struct { Color c; const char *lbl; } leg[] = {
+        {C_MOVING,    "MOVING     (on CPU)"},
+        {C_WAIT_ZONE, "WAIT ZONE  (sem blocked)"},
+        {C_WAIT_CELL, "WAIT CELL  (mutex blocked)"},
+        {C_IDLE,      "IDLE       (at dock)"},
     };
     for (int l = 0; l < 4; l++) {
-        DrawRectangle(px, py + 1, 10, 10, legend[l].c);
-        DrawText(legend[l].lbl, px + 14, py, 11, C_TEXT_DIM);
+        DrawRectangle(px, py + 1, 10, 10, leg[l].c);
+        DrawText(leg[l].lbl, px + 14, py, 11, C_TEXT_DIM);
         py += 15;
     }
+
+    DrawLine(px, py, px + PANEL_W - 10, py, C_BORDER); py += 10;
+    DrawText("CONTROLS", px, py, 12, C_ACCENT); py += 16;
+    DrawText("LClick floor row 1-3  spawn task", px, py, 11, C_HINT); py += 14;
+    DrawText("Esc / X               quit",        px, py, 11, C_TEXT_DIM);
 }
 
 /* ================================================================
    gui_draw_frame
-   Master draw routine.  Called once per frame from the main loop.
-   No mutexes held here -- all data comes from the pre-sampled
-   GuiFrame, so robot threads are never blocked by rendering.
    ================================================================ */
-void gui_draw_frame(const GuiFrame *f, int simRunning) {
+void gui_draw_frame(const GuiFrame *f, int simRunning,
+                    int hoverGX, int hoverGY) {
     BeginDrawing();
     ClearBackground(C_BG);
 
-    /* ---- Title bar ---- */
     DrawText("SMART WAREHOUSE ROBOT COORDINATOR",
              GRID_OFF_X, 12, 20, C_TITLE);
 
-    /* ---- Main grid (left side) ---- */
-    draw_grid(f);
-
-    /* ---- Robot overlays (on top of grid) ---- */
+    draw_grid(f, hoverGX, hoverGY);
     draw_robots(f);
-
-    /* ---- Stats panel (right side) ---- */
     draw_stats_panel(f, simRunning);
 
-    /* ---- Frame rate (bottom-right debug info) ---- */
-    char fpsbuf[32];
-    snprintf(fpsbuf, sizeof(fpsbuf), "FPS: %d", GetFPS());
-    DrawText(fpsbuf, WIN_W - 80, WIN_H - 20, 12, C_TEXT_DIM);
+    char fps[32]; snprintf(fps, 32, "FPS: %d", GetFPS());
+    DrawText(fps, WIN_W - 80, WIN_H - 20, 12, C_TEXT_DIM);
 
     EndDrawing();
 }

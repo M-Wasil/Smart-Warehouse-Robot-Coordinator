@@ -36,6 +36,9 @@ void initWarehouse(Warehouse* wh){
         wh->robotTasksCompleted[r] = 0;
         wh->robotZoneWaits[r] = 0;
         wh->robotCollisionWaits[r] = 0;
+        wh->robotHasItem[r] = 0;
+        wh->robotTargetX[r] = -1;
+        wh->robotTargetY[r] = -1;
     }
     wh->totalCollisionWaits = 0;
     wh->zoneInUse = 0;
@@ -83,7 +86,7 @@ int popTaskAndClaimItem(Warehouse* wh, Task* outTask){
             !wh->items[itemId].claimed &&
             !wh->items[itemId].completed) {
             wh->items[itemId].claimed = 1;
-            wh->items[itemId].available = 0;
+            /* Do NOT set available=0 here. We do it when robot physically reaches pickup cell. */
             *outTask = t;
             pthread_mutex_unlock(&wh->taskMutex);
             return 1;

@@ -57,6 +57,9 @@ typedef struct {
     int        tasksCompleted;
     int        zoneWaits;
     int        collisionWaits;
+    int        hasItem;
+    int        targetX;   /* current nav target column, -1=none */
+    int        targetY;   /* current nav target row,    -1=none */
     /* Pixel position of the robot on screen (derived from task coords) */
     float      screenX;
     float      screenY;
@@ -72,7 +75,8 @@ typedef struct {
     int cellOcc[ROWS][COLS];      /* -1=empty, else robotId        */
 
     /* Item snapshot */
-    int itemAvail[MAX_ITEMS];     /* 1=item on floor, 0=picked/done*/
+    int itemAvail[MAX_ITEMS];     /* 1=item on floor waiting pickup  */
+    int itemCompleted[MAX_ITEMS]; /* 1=item delivered to shelf       */
     int itemX[MAX_ITEMS];
     int itemY[MAX_ITEMS];
     int itemCount;
@@ -103,8 +107,9 @@ void gui_sample_frame(Warehouse *wh, int numRobots, GuiFrame *f,
                       time_t simStart);
 
 /* Draw one complete frame from a pre-sampled GuiFrame.
+   hoverGX, hoverGY = grid cell under the mouse (-1 if none).
    No mutexes held during this call.                          */
-void gui_draw_frame(const GuiFrame *f, int simRunning);
+void gui_draw_frame(const GuiFrame *f, int simRunning, int hoverGX, int hoverGY);
 
 /* Compute pixel centre of grid cell (col=x, row=y) */
 Vector2 gui_cell_center(int gridX, int gridY);

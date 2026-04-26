@@ -1,37 +1,21 @@
 /* ================================================================
-   main_gui.c  --  Entry point for GUI-enabled Warehouse Simulator
+   main_gui.c  --  Entry point for the revamped Warehouse Simulator
 
-   Architecture:
-     - main() runs on the PRIMARY thread (Raylib MUST be driven from
-       the same thread that called InitWindow).
-     - Robot worker threads are spawned with pthread_create as before.
-     - The main thread runs a non-blocking render loop:
-         while (!WindowShouldClose()) {
-             gui_sample_frame(...)  // brief lock to copy state
-             gui_draw_frame(...)    // render from private copy (no lock)
-         }
-     - After the window closes (user presses Esc or Ã— button),
-       wh.running is set to 0 so all robot threads exit cleanly.
-     - pthread_join() then collects each thread before cleanup.
+   Layout (5x5 grid):
+     Row 0 (y=0, top)    : SHELVES  -- items are delivered here
+     Row 1-3 (y=1-3)     : FLOOR    -- navigation / item spawning
+     Row 4 (y=4, bottom) : DOCKS    -- robots park here when idle
 
-   Why this design is safe (OS viva answer):
-     The GUI never holds a mutex while calling any Raylib function.
-     Raylib may call into the OS (OpenGL, window system) and could
-     block.  Holding a mutex while doing OS I/O risks priority
-     inversion and contention.  We copy data OUT under the mutex,
-     release immediately, and then draw from the local copy.
+   Coordinate system:  x=column (0..4), y=row (0..4)
+   cellOccupancy[y][x]  (row first, col second)
 
-   Compile:
-     gcc -std=c99 -Wall -Wextra -g \
-         main_gui.c warehouse.c robot.c task.c gui.c \
-         -o warehouse_gui \
-         -pthread -lm -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
-
-   Or use:  make gui
+   Interaction:
+     Left-click any FLOOR cell (row 1-3) to spawn a new item there.
+     The robot will pick it up and deliver it to a free shelf in row 0.
+     Click on row 0 or row 4 is ignored (shelves / docks).
    ================================================================ */
 
 #define _DEFAULT_SOURCE
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -40,138 +24,192 @@
 
 #include "robot.h"
 #include "gui.h"
+#include "raylib.h"
 
-#define NUM_ROBOTS   3
-#define NUM_TASKS   15
-#define SIM_SECONDS 30   /* window stays open for up to this long */
+#define NUM_ROBOTS 3
+/* Robot dock columns: placed at columns 0, 2, 4 of row 4 */
+static const int DOCK_COLS[NUM_ROBOTS] = {0, 2, 4};
 
+/* ----------------------------------------------------------------
+   screen_to_grid: pixel -> (gx=col, gy=row), returns 1 if inside grid
+   ---------------------------------------------------------------- */
+static int screen_to_grid(int mx, int my, int *gx, int *gy) {
+    int step = CELL_PX + GAP_PX;
+    if (mx < GRID_OFF_X || my < GRID_OFF_Y) return 0;
+    int col = (mx - GRID_OFF_X) / step;
+    int row = (my - GRID_OFF_Y) / step;
+    if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return 0;
+    int lx = (mx - GRID_OFF_X) % step;
+    int ly = (my - GRID_OFF_Y) % step;
+    if (lx >= CELL_PX || ly >= CELL_PX) return 0;
+    *gx = col; *gy = row;
+    return 1;
+}
+
+/* ----------------------------------------------------------------
+   find_free_shelf: pick a random un-occupied shelf column (y=0).
+   Returns -1 if no free shelf exists.
+   ---------------------------------------------------------------- */
+static int find_free_shelf(Warehouse *wh) {
+    /* Collect free shelf columns */
+    int free[COLS], n = 0;
+    pthread_mutex_lock(&wh->stateMutex);
+    for (int x = 0; x < COLS; x++) {
+        if (wh->cellOccupancy[0][x] == -1)
+            free[n++] = x;
+    }
+    pthread_mutex_unlock(&wh->stateMutex);
+    if (n == 0) return -1;
+    return free[rand() % n];
+}
+
+/* ----------------------------------------------------------------
+   spawn_task: create item at (pickX, pickY) and target a shelf.
+   Thread-safe.
+   ---------------------------------------------------------------- */
+static void spawn_task(Warehouse *wh, int pickX, int pickY) {
+    /* Only allow spawning on floor rows (1..3) */
+    if (pickY < 1 || pickY > 3) {
+        printf("[Main] Click ignored: only floor rows 1-3 are valid.\n");
+        return;
+    }
+
+    int shelfCol = find_free_shelf(wh);
+    if (shelfCol < 0) {
+        printf("[Main] All shelves are occupied -- cannot spawn task.\n");
+        return;
+    }
+
+    pthread_mutex_lock(&wh->taskMutex);
+    if (wh->itemCount >= MAX_ITEMS || wh->taskQueue.size >= MAX_TASKS) {
+        pthread_mutex_unlock(&wh->taskMutex);
+        printf("[Main] Queue full -- ignoring click.\n");
+        return;
+    }
+    int newId = wh->itemCount;
+
+    wh->items[newId].id        = newId;
+    wh->items[newId].x         = pickX;
+    wh->items[newId].y         = pickY;
+    wh->items[newId].available = 1;
+    wh->items[newId].claimed   = 0;
+    wh->items[newId].completed = 0;
+    wh->itemCount++;
+    pthread_mutex_unlock(&wh->taskMutex);
+
+    Task t;
+    t.id          = newId + 1000;
+    t.itemId      = newId;
+    t.pickupX     = pickX;
+    t.pickupY     = pickY;
+    t.dropX       = shelfCol;
+    t.dropY       = 0;           /* shelf row */
+    t.priority    = rand() % 5 + 1;
+    t.deadline    = rand() % 10 + 5;
+    t.enqueueTime = (long)time(NULL);
+
+    pushTask(wh, t);
+    printf("[Main] Item %d spawned at floor (%d,%d) -> shelf (%d,0)\n",
+           newId, pickX, pickY, shelfCol);
+}
+
+/* ================================================================
+   main
+   ================================================================ */
 int main(void) {
 
-    /* ---- 1. Initialise shared warehouse ------------------------ */
+    /* ---- 1. Init warehouse ---- */
     Warehouse wh;
     initWarehouse(&wh);
     srand((unsigned int)time(NULL));
 
-    /* ---- 2. Seed item-backed tasks ----------------------------- */
-    for (int i = 0; i < NUM_TASKS; i++) {
-        Task t;
-        t.id        = i;
-        t.itemId    = i;
-        t.pickupX   = rand() % COLS;
-        t.pickupY   = rand() % ROWS;
-        t.dropX     = rand() % COLS;
-        t.dropY     = rand() % ROWS;
-        t.priority  = rand() % 5 + 1;
-        t.deadline  = rand() % 10 + 5;
-
-        wh.items[i].id        = i;
-        wh.items[i].x         = t.pickupX;
-        wh.items[i].y         = t.pickupY;
-        wh.items[i].available = 1;
-        wh.items[i].claimed   = 0;
-        wh.items[i].completed = 0;
-        wh.itemCount++;
-
-        pushTask(&wh, t);
-    }
-
-    /* ---- 3. Open Raylib window --------------------------------- */
-    /*
-     * MUST be called from the main thread before spawning robots.
-     * Raylib's OpenGL context is bound to this thread.
-     */
+    /* ---- 2. Open Raylib window ---- */
     gui_init();
 
-    /* ---- 4. Spawn robot threads -------------------------------- */
+    /* ---- 3. Spawn robot threads, docked at bottom row ---- */
     pthread_t threads[NUM_ROBOTS];
     Robot     robots[NUM_ROBOTS];
     time_t    simStart = time(NULL);
 
     for (int i = 0; i < NUM_ROBOTS; i++) {
-        robots[i].id = i + 1;
-        robots[i].wh = &wh;
+        int dx = DOCK_COLS[i];
+        int dy = ROWS - 1;          /* row 4 = bottom */
+
+        robots[i].id    = i + 1;
+        robots[i].wh    = &wh;
+        robots[i].curX  = dx;
+        robots[i].curY  = dy;
+        robots[i].dockX = dx;
+        robots[i].dockY = dy;
+        robots[i].hasItem = 0;
+
+        /* Reserve initial cell */
+        wh.cellOccupancy[dy][dx] = robots[i].id;
+        pthread_mutex_lock(&wh.gridMutex[dy][dx]);
+
+        /* Robot 2 starts at column 2 (CZ) -- pre-acquire one CZ token */
+        if (dx >= 2 && dx <= 3)
+            sem_wait(&wh.zoneSemaphore);
+
         if (pthread_create(&threads[i], NULL, robotFunc, &robots[i]) != 0) {
-            fprintf(stderr, "[Main] ERROR: pthread_create failed for Robot-%d\n",
-                    i + 1);
+            fprintf(stderr, "[Main] ERROR: pthread_create failed for Robot-%d\n", i+1);
             wh.running = 0;
             gui_close();
             return 1;
         }
     }
 
-    printf("[Main] %d robot threads spawned.  Rendering GUI...\n", NUM_ROBOTS);
-    printf("[Main] Close the window or wait %d seconds to stop.\n", SIM_SECONDS);
+    printf("[Main] %d robots docked at row 4. Click floor cells to spawn tasks.\n",
+           NUM_ROBOTS);
 
-    /* ---- 5. GUI render loop ------------------------------------ */
-    /*
-     * Non-blocking main loop.
-     * Each iteration:
-     *   a) sample_frame  : acquires/releases mutexes briefly
-     *   b) draw_frame    : pure rendering, no locks held
-     *
-     * WindowShouldClose() returns true when the user closes the
-     * window OR presses Escape.
-     *
-     * We also check elapsed time so the sim auto-stops after
-     * SIM_SECONDS even if the window stays open.
-     */
+    /* ---- 4. GUI render loop ---- */
     GuiFrame frame;
-    while (!WindowShouldClose()) {
-        double elapsed = difftime(time(NULL), simStart);
-        int    running = wh.running && (elapsed < (double)SIM_SECONDS);
+    int hoverGX = -1, hoverGY = -1;
 
-        if (!running && wh.running) {
-            /* Time limit reached -- signal robots to stop */
-            wh.running = 0;
+    while (!WindowShouldClose()) {
+
+        Vector2 mp = GetMousePosition();
+        int gx, gy;
+        if (screen_to_grid((int)mp.x, (int)mp.y, &gx, &gy)) {
+            hoverGX = gx; hoverGY = gy;
+        } else {
+            hoverGX = -1; hoverGY = -1;
         }
 
-        /* Sample shared state under minimal lock hold time */
-        gui_sample_frame(&wh, NUM_ROBOTS, &frame, simStart);
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && wh.running) {
+            if (screen_to_grid((int)mp.x, (int)mp.y, &gx, &gy))
+                spawn_task(&wh, gx, gy);
+        }
 
-        /* Draw from private copy (no locks held during rendering) */
-        gui_draw_frame(&frame, wh.running);
+        gui_sample_frame(&wh, NUM_ROBOTS, &frame, simStart);
+        gui_draw_frame(&frame, wh.running, hoverGX, hoverGY);
     }
 
-    /* ---- 6. Signal stop and join all threads ------------------- */
+    /* ---- 5. Stop and join ---- */
     wh.running = 0;
-    printf("\n[Main] Window closed.  Waiting for robot threads...\n");
-
+    printf("\n[Main] Window closed -- joining threads...\n");
     for (int i = 0; i < NUM_ROBOTS; i++) {
         pthread_join(threads[i], NULL);
         printf("[Main] Robot-%d joined.\n", i + 1);
     }
 
-    /* ---- 7. Final performance report (console) ----------------- */
+    /* ---- 6. Report ---- */
     double timeTaken = difftime(time(NULL), simStart);
     printf("\n=== PERFORMANCE REPORT ===\n");
-    printf("Tasks completed : %d\n",   wh.totalTasksCompleted);
-    printf("Time            : %.2f s\n", timeTaken);
-    if (timeTaken > 0.0)
-        printf("Throughput      : %.2f tasks/sec\n",
-               wh.totalTasksCompleted / timeTaken);
-    if (wh.totalTasksCompleted > 0)
-        printf("Avg wait        : %.2f s\n",
-               wh.totalWaitTime / wh.totalTasksCompleted);
-    printf("Zone blocks     : %d\n",   wh.zoneBlockCount);
-    printf("Collision waits : %d\n",   wh.totalCollisionWaits);
+    printf("Tasks completed : %d\n",    wh.totalTasksCompleted);
+    printf("Time            : %.1f s\n", timeTaken);
+    if (timeTaken > 0)
+        printf("Throughput      : %.2f t/s\n", wh.totalTasksCompleted / timeTaken);
+    printf("Zone blocks     : %d\n",    wh.zoneBlockCount);
+    printf("Collision waits : %d\n",    wh.totalCollisionWaits);
+    for (int i = 0; i < NUM_ROBOTS; i++)
+        printf("  Robot-%d  done=%d  zone_w=%d  cell_w=%d\n",
+               i+1, wh.robotTasksCompleted[i],
+               wh.robotZoneWaits[i], wh.robotCollisionWaits[i]);
 
-    printf("\nPer-robot report:\n");
-    for (int i = 0; i < NUM_ROBOTS; i++) {
-        printf("  Robot-%d  done=%d  zone_waits=%d  cell_waits=%d\n",
-               i + 1,
-               wh.robotTasksCompleted[i],
-               wh.robotZoneWaits[i],
-               wh.robotCollisionWaits[i]);
-    }
-
-    /* ---- 8. Cleanup -------------------------------------------- */
+    /* ---- 7. Cleanup ---- */
     gui_close();
-
-    if (wh.logFile) {
-        fprintf(wh.logFile, "\n=== Simulation ended ===\n");
-        fclose(wh.logFile);
-    }
-
-    printf("[Main] Done.  See logs.txt for full log.\n");
+    if (wh.logFile) { fprintf(wh.logFile, "\n=== Simulation ended ===\n"); fclose(wh.logFile); }
+    printf("[Main] Done. See logs.txt\n");
     return 0;
 }
