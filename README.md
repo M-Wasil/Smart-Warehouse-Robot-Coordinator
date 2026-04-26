@@ -63,9 +63,9 @@ sudo apt-get install -y build-essential cmake git libasound2-dev libx11-dev libx
    make install-raylib
    ```
 
-2. **Compile the GUI Version:**
+2. **Compile the Simulation:**
    ```bash
-   make gui
+   make
    ```
 
 3. **Launch the Simulation:**
